@@ -7,6 +7,8 @@ shopt -s globstar
 script_name=$(basename "$0")
 output_file="./music_metadata.csv"
 album_counts_file="./album_counts.csv"
+track_counts_by_genre_file="./track_counts_by_genre.csv"
+artist_track_counts_file="./artist_track_counts.csv"
 invalid_years_file="./invalid_years.csv"
 temp_python_script=$(mktemp /tmp/timeline_script.XXXXXX.py)
 python_venv="${HOME}/python-venv"
@@ -27,6 +29,25 @@ source "$python_venv/bin/activate" || { error "Failed to activate virtual enviro
 # Install required Python packages if not already installed
 pip install --quiet pandas plotly || { error "Failed to install required Python packages."; exit 1; }
 
+# Function to sanitize artist names
+sanitize_artist() {
+    local raw_artist="$1"
+
+    # Replace non-alphanumeric characters (excluding spaces, dashes, and letters) with dashes
+    local sanitized=$(echo "$raw_artist" | sed 's/[^a-zA-Z0-9 -]/-/g')
+    
+    # Replace multiple dashes with a single dash
+    sanitized=$(echo "$sanitized" | sed 's/-\{2,\}/-/g')
+    
+    # Remove leading and trailing dashes
+    sanitized=$(echo "$sanitized" | sed 's/^-//;s/-$//')
+
+    # Ensure sanitized artist name is non-empty
+    [[ -z "$sanitized" ]] && sanitized="Unknown-Artist"
+
+    echo "$sanitized"
+}
+
 # Function to extract metadata efficiently
 extract_metadata() {
     local flac_file="$1"
@@ -43,13 +64,13 @@ extract_metadata() {
 
     # Fallbacks for missing or invalid values
     [[ -z "$album" ]] && album="Unknown Album"
-    if [[ -z "$year" || ! "$year" =~ ^[0-9]{4}$ ]]; then
-#        warn "Invalid YEAR for album '$album' in directory: $dir. Storing in invalid_years.csv"
-        printf '"%s","%s","%s","%s","%s"\n' "$album" "$year" "$genre" "$artist" "$dir" >> "$invalid_years_file"
-        return 1
-    fi
     [[ -z "$genre" ]] && genre="Unknown Genre"
     [[ -z "$artist" ]] && artist="Unknown Artist"
+    if [[ -z "$year" || ! "$year" =~ ^[0-9]{4}$ ]]; then
+        # Write invalid entries to a separate file
+        printf '"%s","%s","%s","%s","%s","%s"\n' "$flac_file" "$album" "$year" "$genre" "$artist" "$dir" >> "$invalid_years_file"
+        return 1  # Indicate invalid year
+    fi
 
     # Escape any internal quotes or commas in fields
     album=$(echo "$album" | sed 's/"/""/g')
@@ -62,15 +83,20 @@ extract_metadata() {
     return 0
 }
 
+# Declare associative arrays for counts
+declare -A genre_counts
+declare -A artist_track_counts
+
 # Initialize output files with headers
 echo "album,year,genre,artist,dir" > "$output_file"
 echo "album,track_count" > "$album_counts_file"
-echo "album,year,genre,artist,dir" > "$invalid_years_file"
+echo "genre,track_count" > "$track_counts_by_genre_file"
+echo "artist,track_count" > "$artist_track_counts_file"
+echo "file_path,album,year,genre,artist,dir" > "$invalid_years_file"
 
 # Iterate through directories and handle files
 info "Scanning directory hierarchy for .flac files..."
 for dir in "$1"/**/; do
-    # Get all .flac files in the current directory
     flac_files=("$dir"/*.flac)
     track_count=${#flac_files[@]}
 
@@ -84,24 +110,40 @@ for dir in "$1"/**/; do
     album_name=$(basename "$dir")
     printf '"%s","%d"\n' "$album_name" "$track_count" >> "$album_counts_file"
 
-    # Try the first file, then the third if necessary
-    if ! metadata=$(extract_metadata "${flac_files[0]}" "$dir"); then
-        warn "First file in $dir is invalid. Trying the third file."
-        if [[ "$track_count" -ge 3 ]]; then
-            metadata=$(extract_metadata "${flac_files[2]}" "$dir") || {
-                error "Third file in $dir is also invalid. Skipping directory."
-                continue
-            }
-        else
-            error "Not enough files in $dir to recover metadata. Skipping directory."
-            continue
-        fi
-    fi
+    # Process each track for genre extraction
+    for flac_file in "${flac_files[@]}"; do
+        # Extract genre and increment its count
+        genre=$(metaflac --export-tags-to=- "$flac_file" | grep -m1 '^GENRE=' | sed 's/^GENRE=//')
+        [[ -z "$genre" ]] && genre="Unknown Genre"
+        genre_counts["$genre"]=$((genre_counts["$genre"] + 1))
 
-    echo "$metadata" >> "$output_file"
+        # Extract metadata and add to artist counts
+        metadata=$(extract_metadata "$flac_file" "$dir")
+        if [[ $? -eq 0 ]]; then
+            echo "$metadata" >> "$output_file"
+            artist=$(echo "$metadata" | cut -d',' -f4 | tr -d '"')
+            artist=$(sanitize_artist "$artist")
+
+            # Log for debugging
+            echo "Processing sanitized artist: [$artist]" >> debug_artist_names.log
+
+            # Increment track count for the artist
+            artist_track_counts["$artist"]=$((artist_track_counts["$artist"] + 1))
+        fi
+    done
 done
 
-info "Metadata extraction complete. Saved to $output_file, $album_counts_file, and $invalid_years_file."
+# Write genre counts to CSV
+for genre in "${!genre_counts[@]}"; do
+    printf '"%s","%d"\n' "$genre" "${genre_counts["$genre"]}" >> "$track_counts_by_genre_file"
+done
+
+# Write artist track counts to CSV
+for artist in "${!artist_track_counts[@]}"; do
+    printf '"%s","%d"\n' "$artist" "${artist_track_counts["$artist"]}" >> "$artist_track_counts_file"
+done
+
+info "Metadata extraction complete. Saved to $output_file, $album_counts_file, $track_counts_by_genre_file, and $artist_track_counts_file."
 
 # Generate Python script for visualizations
 cat <<EOF > "$temp_python_script"
@@ -121,25 +163,32 @@ if 'year' in df.columns:
 else:
     print("The 'year' column is missing from the dataset. Skipping timeline visualization.")
 
-# Visualization 2: Album Track Count Distribution
-album_counts_file = "$album_counts_file"
-df_counts = pd.read_csv(album_counts_file)
-track_distribution = df_counts.groupby('track_count').size().reset_index(name='album_count')
-fig2 = px.bar(track_distribution, x="track_count", y="album_count", title="Album Track Count Distribution")
-fig2.write_html("track_distribution.html")
-print("Track distribution visualization saved as track_distribution.html")
-
-# Visualization 3: Album Count by Artist
-artist_album_count = df.groupby('artist')['album'].nunique().reset_index(name='album_count')
-fig3 = px.bar(artist_album_count, x="artist", y="album_count", title="Album Count by Artist")
-fig3.write_html("artist_album_count.html")
-print("Album count visualization saved as artist_album_count.html")
-
-# Visualization 4: Track Count by Artist
-artist_track_count = df.groupby('artist').size().reset_index(name='track_count')
-fig4 = px.bar(artist_track_count, x="artist", y="track_count", title="Track Count by Artist")
-fig4.write_html("artist_track_count.html")
+# Visualization 2: Track Count by Artist
+artist_track_counts_file = "$artist_track_counts_file"
+df_artist = pd.read_csv(artist_track_counts_file, names=["artist", "track_count"], skiprows=1)
+fig2 = px.bar(df_artist, x="artist", y="track_count", title="Track Count by Artist")
+fig2.write_html("artist_track_count.html")
 print("Track count visualization saved as artist_track_count.html")
+
+# Visualization 3: Track Count by Genre
+track_counts_by_genre_file = "$track_counts_by_genre_file"
+df_genre = pd.read_csv(track_counts_by_genre_file, names=["genre", "track_count"], skiprows=1)
+df_genre["track_count"] = pd.to_numeric(df_genre["track_count"], errors="coerce")
+fig3 = px.treemap(df_genre, path=["genre"], values="track_count", title="Track Count by Genre")
+fig3.write_html("track_count_by_genre_treemap.html")
+print("Track count visualization saved as track_count_by_genre_treemap.html")
+
+# Visualization 4: Album Count by Artist
+df_album_artist = df.groupby('artist')['album'].nunique().reset_index(name='album_count')
+fig4 = px.bar(df_album_artist, x="artist", y="album_count", title="Album Count by Artist")
+fig4.write_html("album_count_by_artist.html")
+print("Album count visualization saved as album_count_by_artist.html")
+
+# Visualization 5: Album Count by Genre
+df_album_genre = df.groupby('genre')['album'].nunique().reset_index(name='album_count')
+fig5 = px.bar(df_album_genre, x="genre", y="album_count", title="Album Count by Genre")
+fig5.write_html("album_count_by_genre.html")
+print("Album count visualization saved as album_count_by_genre.html")
 EOF
 
 info "Python script generated at $temp_python_script."
@@ -147,6 +196,6 @@ info "Python script generated at $temp_python_script."
 # Execute the Python script using the virtual environment
 "$python_venv/bin/python" "$temp_python_script" || { error "Python script execution failed."; exit 1; }
 
-# Clean up temporary Python script
+# Clean
 rm -f "$temp_python_script"
 info "Temporary Python script cleaned up."
